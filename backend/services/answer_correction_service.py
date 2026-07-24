@@ -1,5 +1,3 @@
-from datetime import datetime
-from typing import Optional
 import logging
 
 from config.database import get_database
@@ -14,7 +12,16 @@ class AnswerCorrectionService:
     después no recalcula nada solo. Ver `scripts/recalculate_stats_after_answer_fix.py` (versión
     en lote, para correcciones masivas ya aplicadas) -- esta clase es la misma lógica extraída
     para poder dispararse también en caliente, una sola pregunta a la vez, justo después de que
-    un profesor/admin edite `correct_answer` desde Admin (ver `QuestionService.update_question`)."""
+    un profesor/admin edite `correct_answer` desde Admin (ver `QuestionService.update_question`).
+
+    Compara por TEXTO de la opción correcta (no por índice numérico ni por "valor viejo/nuevo"
+    de una edición concreta): busca dentro del propio snapshot del examen qué opción tiene el
+    mismo texto que la opción correcta ACTUAL de la pregunta, y ese es el índice correcto para
+    ESE snapshot en particular. Esto es necesario porque una pregunta puede editarse varias
+    veces seguidas (texto/opciones incluidos, no solo el índice) -- encadenar "de este valor a
+    este otro" por cada edición deja a medio corregir cualquier examen anterior a la ÚLTIMA
+    edición si no se re-evalúa contra el estado final; comparar por texto siempre converge al
+    valor correcto de verdad, sin importar cuántas ediciones haya habido de por medio."""
 
     def __init__(self):
         self.db = get_database()
@@ -26,37 +33,49 @@ class AnswerCorrectionService:
         self.exam_service = ExamService()
         self.analytics_service = AnalyticsService()
 
-    async def recalculate_for_correction(
-        self,
-        question_id: str,
-        old_value: int,
-        new_value: int,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> dict:
-        """Recalcula todo lo afectado por UN cambio de correct_answer (old_value -> new_value)
-        vigente entre start_time y end_time. Devuelve un resumen con lo tocado, para logging."""
-        if old_value == new_value:
-            return {"exams_patched": 0, "attempts_patched": 0, "users_affected": 0, "progress_patched": 0}
-
+    async def recalculate_for_question(self, question_id: str) -> dict:
+        """Recalcula todo lo afectado por el estado ACTUAL de `correct_answer` de una pregunta.
+        Devuelve un resumen con lo tocado, para logging. Idempotente y seguro de re-ejecutar."""
         db = self.db
 
-        # 1. Parchear el snapshot embebido en los exámenes que se generaron con el valor viejo
-        #    dentro de la ventana de tiempo en que ese valor era "el vigente".
+        question = await db.questions.find_one({"id": question_id}, {"_id": 0})
+        if not question or not question.get("choices") or question["correct_answer"] >= len(question["choices"]):
+            return {"exams_patched": 0, "attempts_patched": 0, "users_affected": 0, "progress_patched": 0}
+        current_correct_text = question["choices"][question["correct_answer"]]
+
+        # 1. Parchear el snapshot embebido en cualquier examen desactualizado: por cada uno,
+        #    buscar dentro de SU PROPIO array de opciones (puede no coincidir con el actual si
+        #    el texto también se editó) cuál tiene el mismo texto que la respuesta correcta de
+        #    hoy. Si no aparece ningún texto igual, no se toca -- mejor dejarlo para revisión
+        #    manual que adivinar un índice.
         patched_exams: dict[str, dict] = {}
-        cursor = db.exams.find(
-            {
-                "questions": {"$elemMatch": {"question_id": question_id, "correct_answer": old_value}},
-                "created_at": {"$gte": start_time, "$lt": end_time},
-            },
-            {"_id": 0},
-        )
+        cursor = db.exams.find({"questions.question_id": question_id}, {"_id": 0})
         async for exam in cursor:
-            for question in exam["questions"]:
-                if question["question_id"] == question_id and question["correct_answer"] == old_value:
-                    question["correct_answer"] = new_value
-            patched_exams[exam["id"]] = exam
-            await db.exams.update_one({"id": exam["id"]}, {"$set": {"questions": exam["questions"]}})
+            changed = False
+            for snap in exam["questions"]:
+                if snap["question_id"] != question_id:
+                    continue
+                snap_choices = snap.get("choices") or []
+                current_text = (
+                    snap_choices[snap["correct_answer"]]
+                    if 0 <= snap.get("correct_answer", -1) < len(snap_choices)
+                    else None
+                )
+                if current_text == current_correct_text:
+                    continue
+                try:
+                    right_index = snap_choices.index(current_correct_text)
+                except ValueError:
+                    logger.warning(
+                        f"No se pudo recalcular examen {exam['id']} para pregunta {question_id}: "
+                        "el texto de la respuesta correcta actual no aparece en el snapshot -- revisar a mano."
+                    )
+                    continue
+                snap["correct_answer"] = right_index
+                changed = True
+            if changed:
+                patched_exams[exam["id"]] = exam
+                await db.exams.update_one({"id": exam["id"]}, {"$set": {"questions": exam["questions"]}})
 
         # 2. Recalcular la nota de los intentos ya terminados sobre esos exámenes.
         attempts_to_patch: dict[str, dict] = {}
@@ -146,5 +165,5 @@ class AnswerCorrectionService:
             "users_affected": len(affected_users),
             "progress_patched": progress_patched,
         }
-        logger.info(f"Recalculo tras corregir pregunta {question_id} ({old_value}->{new_value}): {summary}")
+        logger.info(f"Recalculo para pregunta {question_id}: {summary}")
         return summary

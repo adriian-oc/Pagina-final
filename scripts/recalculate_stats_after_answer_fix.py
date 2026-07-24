@@ -3,27 +3,27 @@ Recalcula las notas/estadísticas de alumnos que se vieron afectadas por una cor
 `correct_answer` en una pregunta (vía Admin o vía los scripts de corrección masiva de
 Test de Teoría). El bug: la nota de un examen se calcula UNA VEZ, al terminarlo, usando el
 snapshot de la pregunta guardado dentro de `exams.questions[]` en ese momento -- corregir
-`questions.correct_answer` después no recalcula nada solo, así que un alumno que respondió
-bien antes de la corrección puede seguir figurando como fallo.
+`questions.correct_answer` después no recalcula nada solo.
 
-Toca, para cada pregunta con `edit_history` (cualquier corrección, no solo las del bug de
-julio 2026):
-  1. `exams.questions[].correct_answer` -- parchea el snapshot embebido, para que cualquier
-     examen todavía sin terminar puntúe ya con el valor correcto al finalizarlo.
+Compara por TEXTO de la opción correcta, no por índice numérico encadenado entre ediciones:
+por cada examen que contiene la pregunta, busca dentro del propio snapshot (que puede tener
+texto/opciones distintos si también se editaron, no solo el índice) cuál opción tiene el mismo
+texto que la respuesta correcta ACTUAL de la pregunta -- así siempre converge al valor
+correcto de verdad sin importar cuántas ediciones haya habido de por medio (una versión
+anterior de este script encadenaba "valor viejo -> valor nuevo" de la edición más reciente y
+podía dejar a medio corregir examenes anteriores a ediciones intermedias -- ver commit que
+introduce este comentario).
+
+Toca, para cada pregunta con `edit_history`:
+  1. `exams.questions[].correct_answer` -- parchea el snapshot embebido.
   2. `attempts.score` / `attempts.details` -- para los intentos YA terminados con ese snapshot
-     erróneo, recalcula la nota completa reutilizando `ExamService._calculate_score` (la misma
-     lógica que usa la app, no una reimplementación aparte).
-  3. `user_theme_stats` / `analytics_failures` -- estos son contadores ACUMULADOS por alumno
-     (no derivables con una simple resta), así que para cada alumno afectado se reconstruyen
-     desde cero, reproduciendo TODOS sus intentos terminados (ya corregidos) con
-     `AnalyticsService.record_attempt_results` -- el mismo camino que ya usa la app al terminar
-     un examen, no una reimplementación aparte.
+     erróneo, recalcula la nota completa reutilizando `ExamService._calculate_score`.
+  3. `user_theme_stats` / `analytics_failures` -- contadores ACUMULADOS por alumno, se
+     reconstruyen desde cero reproduciendo TODOS los intentos terminados (ya corregidos) del
+     alumno con `AnalyticsService.record_attempt_results`.
   4. `progress.content_scores[content_unit_key]` -- solo se actualizan `correct/total/pct` si
      el intento más reciente de esa unidad es uno de los corregidos (no se re-simula el estado
-     SM-2 -- ease_factor/repetitions/interval_days -- retroactivamente; ese sistema además está
-     previsto para sustituirse por completo por el nuevo motor de repetición espaciada del
-     punto 8 de CONTINUATION.md, así que no compensa el esfuerzo de una réplica histórica
-     completa aquí).
+     SM-2 retroactivamente).
 
 Uso:
   Comprobar sin escribir nada:
@@ -33,8 +33,7 @@ Uso:
     cd backend && source venv/bin/activate && python ../scripts/recalculate_stats_after_answer_fix.py
 
 Idempotente: si se relanza sin que haya correcciones nuevas de por medio, no encuentra nada que
-tocar (los exámenes ya están al día, la reconstrucción de user_theme_stats/analytics_failures da
-el mismo resultado).
+tocar.
 """
 import asyncio
 import os
@@ -47,24 +46,6 @@ from services.exam_service import ExamService  # noqa: E402
 from services.analytics_service import AnalyticsService  # noqa: E402
 
 
-def _find_value_windows(question: dict) -> list[dict]:
-    """A partir del edit_history de una pregunta, reconstruye la secuencia de valores que tuvo
-    `correct_answer` a lo largo del tiempo: [(valor, desde, hasta), ...]. edit_history[i] guarda
-    el estado ANTERIOR a la edición i-ésima; el valor vigente tras esa edición es el de la
-    siguiente entrada del historial, o el `correct_answer` actual si es la última."""
-    history = question.get("edit_history") or []
-    windows = []
-    prev_time = question["created_at"]
-    for i, entry in enumerate(history):
-        old_val = entry["correct_answer"]
-        new_val = history[i + 1]["correct_answer"] if i + 1 < len(history) else question["correct_answer"]
-        end_time = entry["edited_at"]
-        if old_val != new_val:
-            windows.append({"old": old_val, "new": new_val, "start": prev_time, "end": end_time})
-        prev_time = end_time
-    return windows
-
-
 async def main(dry_run: bool):
     await connect_to_mongo()
     db = get_database()
@@ -74,39 +55,54 @@ async def main(dry_run: bool):
     questions_with_history = await db.questions.find(
         {"edit_history": {"$exists": True, "$ne": []}}, {"_id": 0}
     ).to_list(length=None)
-
-    corrections = []
-    for q in questions_with_history:
-        for w in _find_value_windows(q):
-            corrections.append({"question_id": q["id"], **w})
-
     print(f"Preguntas con historial de edición: {len(questions_with_history)}")
-    print(f"Cambios de valor a replicar: {len(corrections)}")
 
-    # 1. Parchear snapshots de exámenes (en memoria siempre; en Mongo solo si no es dry-run)
+    # 1. Parchear snapshots de exámenes desactualizados (en memoria siempre; en Mongo solo si
+    #    no es dry-run), comparando por texto de la opción correcta.
     patched_exams: dict[str, dict] = {}
-    for c in corrections:
-        cursor = db.exams.find(
-            {
-                "questions": {"$elemMatch": {"question_id": c["question_id"], "correct_answer": c["old"]}},
-                "created_at": {"$gte": c["start"], "$lt": c["end"]},
-            },
-            {"_id": 0},
-        )
-        async for exam in cursor:
-            exam_doc = patched_exams.setdefault(exam["id"], exam)
-            for question in exam_doc["questions"]:
-                if question["question_id"] == c["question_id"] and question["correct_answer"] == c["old"]:
-                    question["correct_answer"] = c["new"]
+    unresolved = 0
+    for question in questions_with_history:
+        if not question.get("choices") or question["correct_answer"] >= len(question["choices"]):
+            continue
+        current_correct_text = question["choices"][question["correct_answer"]]
 
-    print(f"Exámenes con preguntas afectadas: {len(patched_exams)}")
+        cursor = db.exams.find({"questions.question_id": question["id"]}, {"_id": 0})
+        async for exam in cursor:
+            changed = False
+            for snap in exam["questions"]:
+                if snap["question_id"] != question["id"]:
+                    continue
+                snap_choices = snap.get("choices") or []
+                current_text = (
+                    snap_choices[snap["correct_answer"]]
+                    if 0 <= snap.get("correct_answer", -1) < len(snap_choices)
+                    else None
+                )
+                if current_text == current_correct_text:
+                    continue
+                try:
+                    right_index = snap_choices.index(current_correct_text)
+                except ValueError:
+                    unresolved += 1
+                    print(
+                        f"  AVISO: examen {exam['id']} / pregunta {question['id']} -- el texto de la "
+                        "respuesta correcta actual no aparece en el snapshot, se omite (revisar a mano)"
+                    )
+                    continue
+                snap["correct_answer"] = right_index
+                changed = True
+            if changed:
+                patched_exams[exam["id"]] = exam
+
+    print(f"Exámenes con snapshot desactualizado: {len(patched_exams)}")
+    print(f"Casos sin poder resolver por texto (requieren revisión manual): {unresolved}")
     if not dry_run:
         for exam_id, exam_doc in patched_exams.items():
             await db.exams.update_one({"id": exam_id}, {"$set": {"questions": exam_doc["questions"]}})
 
-    # 2. Recalcular la nota de los intentos ya terminados sobre esos exámenes
+    # 2. Recalcular la nota de los intentos ya terminados sobre esos exámenes.
     exam_ids = list(patched_exams.keys())
-    attempts_to_patch: dict[str, dict] = {}  # attempt_id -> {"user_id":, "results": [...], "score":, "details":}
+    attempts_to_patch: dict[str, dict] = {}
     affected_users: set[str] = set()
 
     if exam_ids:

@@ -92,23 +92,16 @@ class QuestionService:
                 detail="Failed to update question"
             )
 
-        # Si cambió la respuesta correcta, recalcular en caliente las notas/estadísticas de
-        # alumnos que ya habían respondido esta pregunta con el valor anterior (ver
-        # AnswerCorrectionService -- la nota de un examen se congela al terminarlo, no se
-        # recalcula sola). No debe romper la propia edición si falla.
-        new_correct_answer = question_data.get("correct_answer")
-        if edited_at is not None and new_correct_answer is not None and new_correct_answer != existing["correct_answer"]:
+        # Si cambió el texto, las opciones o la respuesta correcta, recalcular en caliente las
+        # notas/estadísticas de alumnos que ya habían respondido esta pregunta con el estado
+        # anterior (ver AnswerCorrectionService -- la nota de un examen se congela al
+        # terminarlo, no se recalcula sola; y un cambio de texto en las opciones, aunque no
+        # toque el índice, puede invalidar a qué apuntaba un snapshot antiguo). No debe romper
+        # la propia edición si falla.
+        if edited_at is not None:
             try:
                 from services.answer_correction_service import AnswerCorrectionService
-                history = existing.get("edit_history") or []
-                start_time = history[-1]["edited_at"] if history else existing["created_at"]
-                await AnswerCorrectionService().recalculate_for_correction(
-                    question_id=question_id,
-                    old_value=existing["correct_answer"],
-                    new_value=new_correct_answer,
-                    start_time=start_time,
-                    end_time=edited_at,
-                )
+                await AnswerCorrectionService().recalculate_for_question(question_id)
             except Exception as e:
                 logger.error(f"Failed to recalculate stats after correcting question {question_id}: {e}")
 
