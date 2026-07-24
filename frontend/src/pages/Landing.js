@@ -114,13 +114,6 @@ const Landing = () => {
             >
               Quiero preparar mi oposición
             </Link>
-            <Link
-              to="/trabaja-con-nosotros"
-              className="px-6 py-3 bg-white text-primary-700 border border-primary-300 rounded-md font-semibold hover:bg-primary-50"
-              data-testid="landing-cta-teacher"
-            >
-              Quiero dar clases
-            </Link>
           </div>
         </div>
       </section>
@@ -188,12 +181,6 @@ const Landing = () => {
             >
               Quiero preparar mi oposición
             </Link>
-            <Link
-              to="/trabaja-con-nosotros"
-              className="px-6 py-3 bg-primary-700 text-white border border-primary-400 rounded-md font-semibold hover:bg-primary-800"
-            >
-              Quiero dar clases
-            </Link>
           </div>
           <Link to="/login" className="mt-5 inline-block text-sm text-primary-100 hover:text-white">
             ¿Ya tienes cuenta? Inicia sesión
@@ -211,6 +198,9 @@ const Landing = () => {
           <a href="https://instagram.com/oposicionesadoc" target="_blank" rel="noopener noreferrer" className="hover:text-primary-600">
             @oposicionesadoc
           </a>
+          <Link to="/trabaja-con-nosotros" className="hover:text-primary-600" data-testid="landing-cta-teacher">
+            ¿Eres profesor?
+          </Link>
         </div>
       </footer>
     </div>
